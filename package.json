@@ -1,0 +1,20 @@
+{
+  "name": "discord-soundcloud-music-bot",
+  "version": "1.0.0",
+  "description": "Discord + SoundCloud music bot example",
+  "main": "src/bot.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node src/bot.js",
+    "check": "node --check src/bot.js"
+  },
+  "engines": {
+    "node": ">=18.17.0"
+  },
+  "dependencies": {
+    "@discordjs/voice": "^0.17.0",
+    "discord.js": "^14.15.3",
+    "dotenv": "^16.4.5",
+    "play-dl": "^1.9.7"
+  }
+}
