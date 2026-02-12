@@ -5,6 +5,7 @@ const {
   GatewayIntentBits,
   EmbedBuilder,
   Events,
+  SlashCommandBuilder,
 } = require('discord.js');
 const {
   createAudioPlayer,
@@ -19,7 +20,6 @@ const {
 const play = require('play-dl');
 
 const token = process.env.DISCORD_TOKEN;
-const prefix = process.env.PREFIX || '!';
 
 if (!token) {
   throw new Error('DISCORD_TOKEN 환경 변수가 필요합니다. .env 파일을 확인하세요.');
@@ -34,80 +34,92 @@ if (!token) {
  * }>} */
 const guildStates = new Map();
 
+const commands = [
+  new SlashCommandBuilder()
+    .setName('play')
+    .setDescription('사운드클라우드 URL을 재생하거나 대기열에 추가합니다.')
+    .addStringOption((option) =>
+      option
+        .setName('url')
+        .setDescription('사운드클라우드 트랙 URL (soundcloud.com / on.soundcloud.com)')
+        .setRequired(true)
+    ),
+  new SlashCommandBuilder().setName('skip').setDescription('현재 곡을 스킵합니다.'),
+  new SlashCommandBuilder().setName('stop').setDescription('재생을 정지하고 퇴장합니다.'),
+  new SlashCommandBuilder().setName('queue').setDescription('대기열을 표시합니다.'),
+  new SlashCommandBuilder().setName('help').setDescription('사용 가능한 명령어를 보여줍니다.'),
+].map((command) => command.toJSON());
+
 const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent,
-    GatewayIntentBits.GuildVoiceStates,
-  ],
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
 });
 
-client.once(Events.ClientReady, () => {
+client.once(Events.ClientReady, async () => {
   console.log(`✅ 로그인 완료: ${client.user.tag}`);
+  await client.application.commands.set(commands);
+  console.log('✅ 슬래시 명령어 등록 완료');
 });
 
-client.on(Events.MessageCreate, async (message) => {
-  if (message.author.bot || !message.guild) return;
-  if (!message.content.startsWith(prefix)) return;
-
-  const [command, ...rest] = message.content.slice(prefix.length).trim().split(/\s+/);
-  const query = rest.join(' ').trim();
+client.on(Events.InteractionCreate, async (interaction) => {
+  if (!interaction.isChatInputCommand() || !interaction.guild) return;
 
   try {
-    switch (command?.toLowerCase()) {
+    switch (interaction.commandName) {
       case 'play':
-      case 'p':
-        await handlePlay(message, query);
+        await handlePlay(interaction);
         break;
       case 'skip':
-        await handleSkip(message);
+        await handleSkip(interaction);
         break;
       case 'stop':
-        await handleStop(message);
+        await handleStop(interaction);
         break;
       case 'queue':
-      case 'q':
-        await handleQueue(message);
+        await handleQueue(interaction);
         break;
       case 'help':
-        await handleHelp(message);
+        await handleHelp(interaction);
         break;
       default:
         break;
     }
   } catch (error) {
     console.error(error);
-    await message.reply('오류가 발생했어요. 로그를 확인해주세요.');
+    if (interaction.deferred || interaction.replied) {
+      await interaction.followUp({ content: '오류가 발생했어요. 로그를 확인해주세요.', ephemeral: true });
+      return;
+    }
+
+    await interaction.reply({ content: '오류가 발생했어요. 로그를 확인해주세요.', ephemeral: true });
   }
 });
 
-async function handlePlay(message, query) {
-  if (!query) {
-    await message.reply('사용법: `!play <사운드클라우드 URL>`');
-    return;
-  }
+async function handlePlay(interaction) {
+  const rawUrl = interaction.options.getString('url', true);
+  await interaction.deferReply();
 
-  const validation = play.so_validate(query);
-  if (validation !== 'track') {
-    await message.reply('현재는 **SoundCloud 트랙 URL**만 재생할 수 있어요.');
-    return;
-  }
-
-  const voiceChannel = message.member.voice.channel;
+  const voiceChannel = interaction.member.voice.channel;
   if (!voiceChannel) {
-    await message.reply('먼저 음성 채널에 들어가 주세요.');
+    await interaction.editReply('먼저 음성 채널에 들어가 주세요.');
     return;
   }
 
-  const guildId = message.guild.id;
+  const resolvedUrl = await resolveSoundCloudTrackUrl(rawUrl);
+  if (!resolvedUrl) {
+    await interaction.editReply(
+      '지원하지 않는 URL입니다. `soundcloud.com` 트랙 URL 또는 `on.soundcloud.com` 단축 URL을 사용해주세요.'
+    );
+    return;
+  }
+
+  const guildId = interaction.guild.id;
   let state = guildStates.get(guildId);
 
   if (!state) {
     const connection = joinVoiceChannel({
       channelId: voiceChannel.id,
       guildId,
-      adapterCreator: message.guild.voiceAdapterCreator,
+      adapterCreator: interaction.guild.voiceAdapterCreator,
       selfDeaf: true,
     });
 
@@ -142,24 +154,63 @@ async function handlePlay(message, query) {
       connection,
       player,
       queue: [],
-      textChannelId: message.channel.id,
+      textChannelId: interaction.channelId,
       playing: false,
     };
 
     guildStates.set(guildId, state);
   }
 
-  const info = await play.soundcloud(query);
+  const info = await play.soundcloud(resolvedUrl);
   state.queue.push({
-    url: query,
-    title: info.name || query,
-    requestedBy: message.author.tag,
+    url: resolvedUrl,
+    title: info.name || resolvedUrl,
+    requestedBy: interaction.user.tag,
   });
 
-  await message.reply(`✅ 대기열에 추가: **${info.name || '알 수 없는 제목'}**`);
+  await interaction.editReply(`✅ 대기열에 추가: **${info.name || '알 수 없는 제목'}**`);
 
   if (!state.playing) {
     await playNext(guildId);
+  }
+}
+
+async function resolveSoundCloudTrackUrl(input) {
+  const cleaned = input.trim().replace(/^<|>$/g, '');
+
+  let parsed;
+  try {
+    parsed = new URL(cleaned);
+  } catch {
+    return null;
+  }
+
+  const host = parsed.hostname.toLowerCase();
+  if (host === 'on.soundcloud.com' || host.endsWith('.on.soundcloud.com')) {
+    const redirected = await followRedirect(cleaned);
+    if (!redirected) return null;
+    return play.so_validate(redirected) === 'track' ? redirected : null;
+  }
+
+  if (host === 'soundcloud.com' || host.endsWith('.soundcloud.com')) {
+    return play.so_validate(cleaned) === 'track' ? cleaned : null;
+  }
+
+  return null;
+}
+
+async function followRedirect(url) {
+  try {
+    const response = await fetch(url, {
+      method: 'GET',
+      redirect: 'follow',
+      headers: { 'user-agent': 'Mozilla/5.0 DiscordMusicBot/1.0' },
+    });
+
+    return response.url;
+  } catch (error) {
+    console.error('URL 리다이렉트 해석 실패:', error.message);
+    return null;
   }
 }
 
@@ -188,36 +239,36 @@ async function playNext(guildId) {
   }
 }
 
-async function handleSkip(message) {
-  const state = guildStates.get(message.guild.id);
+async function handleSkip(interaction) {
+  const state = guildStates.get(interaction.guild.id);
   if (!state || !state.playing) {
-    await message.reply('현재 재생 중인 노래가 없어요.');
+    await interaction.reply({ content: '현재 재생 중인 노래가 없어요.', ephemeral: true });
     return;
   }
 
   state.player.stop(true);
-  await message.reply('⏭️ 다음 곡으로 스킵합니다.');
+  await interaction.reply('⏭️ 다음 곡으로 스킵합니다.');
 }
 
-async function handleStop(message) {
-  const state = guildStates.get(message.guild.id);
+async function handleStop(interaction) {
+  const state = guildStates.get(interaction.guild.id);
   if (!state) {
-    await message.reply('봇이 음성 채널에 연결되어 있지 않아요.');
+    await interaction.reply({ content: '봇이 음성 채널에 연결되어 있지 않아요.', ephemeral: true });
     return;
   }
 
   state.queue.length = 0;
   state.player.stop(true);
   state.connection.destroy();
-  guildStates.delete(message.guild.id);
+  guildStates.delete(interaction.guild.id);
 
-  await message.reply('⏹️ 재생을 중지하고 채널에서 나갔어요.');
+  await interaction.reply('⏹️ 재생을 중지하고 채널에서 나갔어요.');
 }
 
-async function handleQueue(message) {
-  const state = guildStates.get(message.guild.id);
+async function handleQueue(interaction) {
+  const state = guildStates.get(interaction.guild.id);
   if (!state || state.queue.length === 0) {
-    await message.reply('대기열이 비어 있어요.');
+    await interaction.reply({ content: '대기열이 비어 있어요.', ephemeral: true });
     return;
   }
 
@@ -227,16 +278,16 @@ async function handleQueue(message) {
     .setDescription(lines.join('\n'))
     .setColor(0xff5500);
 
-  await message.reply({ embeds: [embed] });
+  await interaction.reply({ embeds: [embed] });
 }
 
-async function handleHelp(message) {
-  await message.reply([
-    '**명령어 안내**',
-    `\`${prefix}play <사운드클라우드 URL>\` : 곡 추가/재생`,
-    `\`${prefix}skip\` : 현재 곡 스킵`,
-    `\`${prefix}queue\` : 대기열 보기`,
-    `\`${prefix}stop\` : 재생 종료 후 퇴장`,
+async function handleHelp(interaction) {
+  await interaction.reply([
+    '**명령어 안내 (슬래시 명령어)**',
+    '`/play url:<사운드클라우드 URL>` : 곡 추가/재생',
+    '`/skip` : 현재 곡 스킵',
+    '`/queue` : 대기열 보기',
+    '`/stop` : 재생 종료 후 퇴장',
   ].join('\n'));
 }
 
